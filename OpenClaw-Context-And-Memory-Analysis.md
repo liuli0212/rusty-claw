@@ -89,3 +89,138 @@ OpenClaw 构建了一个自带的本地 RAG 系统，旨在解决“跨会话记
 2.  **防御性上下文管理**：必须实现**工具输出截断 (Tool Result Truncation)**，这是单体 Agent 最容易暴毙的死穴（例如误 cat 了一个 10MB 的 bundle.js）。
 3.  **混合检索是标配**：纯 Vector 检索在代码或精准指令场景下表现糟糕。必须结合全文检索（BM25），这是 RAG 的最佳实践。
 4.  **动态 Prompt 装配**：不要写死 System Prompt。根据工具、环境、召回的记忆动态生成结构化的 System Prompt，能大幅提高模型遵循指令的概率。
+## 六、 源码深度解析：Prompt 组装流水线 (The Assembly Pipeline)
+
+上一节讲到了“动态 Prompt 装配”的宏观设计，这部分我们将直接切入源码，追踪 OpenClaw 是如何一步步将历史、工具、环境变量组装成发送给 LLM 的最终 Prompt 的。
+
+核心的流程入口在 `src/agents/pi-embedded-runner/run/attempt.ts` 中的 `runEmbeddedAttempt` 函数，它负责统筹一次完整的 LLM 推理过程。而具体拼接系统提示词的苦力活，则交给了 `src/agents/system-prompt.ts`。
+
+### 1. 组装流程全景图 (Pipeline ASCII Diagram)
+
+在 `runEmbeddedAttempt` 中，Prompt 的构建不是一步到位的，而是先准备各种离散的 Context 模块，最后统一注入。
+
+```text
+[User Request / Trigger]
+         │
+         ▼
+ ┌─────────────────────────────────────────────────────────┐
+ │               runEmbeddedAttempt()                      │
+ │   (src/agents/pi-embedded-runner/run/attempt.ts)        │
+ ├─────────────────────────────────────────────────────────┤
+ │ 1. Environment & Sandbox Setup                          │
+ │    - Resolve workspace (`effectiveWorkspace`)           │
+ │    - Configure Docker/Sandbox access                    │
+ │                                                         │
+ │ 2. Tooling Initialization (`createOpenClawCodingTools`) │
+ │    - Built-in tools + Custom client tools               │
+ │    - Sanitize for specific providers (e.g. Google)      │
+ │                                                         │
+ │ 3. Context & History Retrieval                          │
+ │    - Skills context (`resolveSkillsPromptForRun`)       │
+ │    - Bootstrap files (`resolveBootstrapContextForRun`)  │
+ │      (loads AGENTS.md, SOUL.md, MEMORY.md, etc.)        │
+ │                                                         │
+ │ 4. System Prompt Assembly                               │
+ │    - Call `buildEmbeddedSystemPrompt()` /               │
+ │           `buildAgentSystemPrompt()`                    │
+ │                                                         │
+ │ 5. Session Loading & Guarding                           │
+ │    - `SessionManager.open(sessionFile)`                 │
+ │    - `guardSessionManager()` (applies truncation)       │
+ │                                                         │
+ │ 6. Launch LLM Agent                                     │
+ │    - `createAgentSession()` (from @mariozechner/...)    │
+ │    - Passes System Prompt + SessionManager              │
+ └─────────────────────────────────────────────────────────┘
+         │
+         ▼
+[ LLM Provider API (Anthropic / OpenAI / Gemini) ]
+```
+
+### 2. 核心代码追踪
+
+#### 步骤 A: 准备工作区和上下文模块 (`attempt.ts`)
+在 `runEmbeddedAttempt` 启动后，首先解决的是**外部知识的挂载**。包括：
+*   **Skills**: 通过 `resolveSkillsPromptForRun` 提取用户当前加载的技能。
+*   **Context Files**: 通过 `resolveBootstrapContextForRun` 读取当前工作目录下的约定文件（比如用户自己写的 `AGENTS.md` 或项目的 `SOUL.md`）。这是非常巧妙的免配置（Zero-config）设计，Agent 会自动感知并“阅读”这些环境文件。
+
+```typescript
+// src/agents/pi-embedded-runner/run/attempt.ts (约 334 行)
+const skillsPrompt = resolveSkillsPromptForRun({
+  skillsSnapshot: params.skillsSnapshot,
+  entries: shouldLoadSkillEntries ? skillEntries : undefined,
+  config: params.config,
+  workspaceDir: effectiveWorkspace,
+});
+
+const { bootstrapFiles: hookAdjustedBootstrapFiles, contextFiles } =
+  await resolveBootstrapContextForRun({
+    workspaceDir: effectiveWorkspace,
+    // ...
+  });
+```
+
+#### 步骤 B: 拼接 System Prompt 字符串 (`system-prompt.ts`)
+真正的长字符串拼接发生在 `src/agents/system-prompt.ts` 中的 `buildAgentSystemPrompt` (或其上层封装)。这里展示了 OpenClaw 极其细致的 Prompt 结构：
+
+它按照以下顺序拼接一个庞大的 Array，最后 `join('\n')`：
+1.  **Identity (人设)**: `"You are a personal assistant running inside OpenClaw."`
+2.  **Tooling (工具表)**: 动态遍历可用工具并附上 Summary。
+    ```typescript
+    // src/agents/system-prompt.ts
+    "## Tooling",
+    "Tool availability (filtered by policy):",
+    "Tool names are case-sensitive. Call tools exactly as listed.",
+    toolLines.join("\n"),
+    ```
+3.  **Safety & Guardrails (安全守则)**: 注入防止越狱和自我保护的硬性规定（启发自 Anthropic 的 constitution）。
+4.  **Skills (技能指令)**: `buildSkillsSection` 将前面提取的技能文本原样塞入。
+5.  **Memory (长期记忆)**: `buildMemorySection` 将 RAG 引擎召回的记忆区块注入。
+6.  **Environment (环境状态)**: 包括当前工作目录、时间、操作系统、甚至终端 Shell 的类型。
+    ```typescript
+    // src/agents/system-prompt.ts
+    "## Workspace",
+    `Your working directory is: ${displayWorkspaceDir}`,
+    workspaceGuidance,
+    ```
+7.  **Injected Files (注入文件)**: 将 `contextFiles`（比如 `SOUL.md`）的内容全文拼接到 Prompt 尾部。
+    ```typescript
+    // src/agents/system-prompt.ts
+    if (validContextFiles.length > 0) {
+      lines.push("# Project Context", "", "The following project context files have been loaded:");
+      for (const file of validContextFiles) {
+        lines.push(`## ${file.path}`, "", file.content, "");
+      }
+    }
+    ```
+
+#### 步骤 C: Session 组装与历史截断 (`attempt.ts`)
+有了庞大的 System Prompt 后，如何与之前产生的 JSONL 会话历史（Short-term Memory）合并呢？
+
+OpenClaw 并没有手动拼凑这些历史文本，而是交给了底层的 `@mariozechner/pi-coding-agent` SDK，但它通过 `guardSessionManager` 插入了强大的保护机制。
+
+```typescript
+// src/agents/pi-embedded-runner/run/attempt.ts (约 593 行)
+sessionManager = guardSessionManager(SessionManager.open(params.sessionFile), {
+  agentId: sessionAgentId,
+  sessionKey: params.sessionKey,
+  inputProvenance: params.inputProvenance,
+  allowSyntheticToolResults: transcriptPolicy.allowSyntheticToolResults,
+  allowedToolNames,
+});
+```
+
+这个 `guardSessionManager` 是整个上下文管理最核心的“门神”。它拦截了每一次从底层加载历史的请求：
+1.  **限制回合 (Turn Limits)**: 防止历史过长。
+2.  **过滤非法工具 (Tool Filtering)**: 如果历史里包含了当前因为 Sandbox 策略被禁用的工具调用，直接过滤掉，防止 LLM 产生幻觉去调用不存在的工具。
+3.  **工具输出截断 (Tool Result Truncation)**: (在更早的流程注册) 防止 `cat <huge-file>` 导致上下文超限。
+
+最终，通过 `createAgentSession` 启动。底层的 `Agent` 类会自动将 `System Prompt + (Guarded) History + New User Message` 打包，转换为对应 LLM Provider (如 Anthropic 的 `messages` 数组) 接受的格式并发起请求。
+
+### 3. 结论与总结
+
+通过代码分析，我们可以清晰地看到 OpenClaw 解决“Context 和 Memory 管理”的思路：
+
+1.  **Prompt 是乐高积木**：不再使用长篇大论的静态文本，而是基于当前的任务类型、安全策略和系统环境，在运行时将数十个小模块（Tools, Memory, Skills, OS Info）**动态拼接**起来。
+2.  **把控生命周期的咽喉**：对短期历史，它不去修改存储底座（JSONL），而是通过 `guardSessionManager` 在**读取时进行实时拦截与清洗**。这保证了原始数据的完整性，同时保护了 LLM 不被垃圾数据冲垮。
+3.  **文件级上下文（Bootstrap Context）的妙用**：允许用户在项目目录下扔一个 `AGENTS.md`，系统自动将其读取并拼接到 `# Project Context` 中。这种方式比让用户在 UI 里填 System Prompt 优雅且符合开发者的直觉。
